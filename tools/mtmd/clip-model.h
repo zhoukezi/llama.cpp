@@ -100,6 +100,12 @@ struct clip_hparams {
     int32_t audio_window_len  = -1;
     int32_t audio_hop_len     = -1;
 
+    // midashenglm (Dasheng / DashengTokenizer)
+    int32_t audio_target_length   = 0;         // target mel frames for segmented encoding
+    int32_t audio_patch_size[2]   = { 0, 0 };  // [freq, time]
+    int32_t audio_patch_stride[2] = { 0, 0 };  // [freq, time]
+    int32_t n_mel_bins_acoustic   = 0;         // DashengTokenizer acoustic branch mel bins (e.g. 100)
+
     // legacy
     bool has_llava_projector = false;
     int minicpmv_version = 0;
@@ -484,6 +490,17 @@ struct clip_model {
     ggml_tensor * sscp_inp_proj_b = nullptr;
     ggml_tensor * audio_out_proj_w = nullptr;
     ggml_tensor * audio_out_proj_b = nullptr;
+
+    // midashenglm (Dasheng audio encoder – semantic branch)
+    ggml_tensor * init_bn_scale     = nullptr;  // fused: weight / sqrt(var + eps)
+    ggml_tensor * init_bn_shift     = nullptr;  // fused: bias - scale * mean
+    ggml_tensor * a_patch_embd_w    = nullptr;  // Conv2d weight
+    ggml_tensor * a_patch_embd_b    = nullptr;  // Conv2d bias
+    // DashengTokenizer acoustic branch
+    ggml_tensor * a_ac_patch_embd_w = nullptr;  // Conv2d weight [embed_dim, 1, n_mels_ac, patch_w]
+    ggml_tensor * a_ac_patch_embd_b = nullptr;
+    ggml_tensor * a_ac_post_ln_w    = nullptr;
+    ggml_tensor * a_ac_post_ln_b    = nullptr;
 
     bool audio_has_avgpool() const {
         return proj_type == PROJECTOR_TYPE_QWEN2A

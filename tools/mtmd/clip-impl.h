@@ -63,6 +63,10 @@
 #define KEY_AUDIO_PROJ_TYPE     "clip.audio.projector_type" // for models with mixed modalities
 #define KEY_A_NUM_MEL_BINS      "clip.audio.num_mel_bins"
 #define KEY_A_PROJ_STACK_FACTOR "clip.audio.projector.stack_factor"
+#define KEY_A_TARGET_LENGTH     "clip.audio.target_length"
+#define KEY_A_PATCH_SIZE        "clip.audio.patch_size"
+#define KEY_A_PATCH_STRIDE      "clip.audio.patch_stride"
+#define KEY_A_NUM_MEL_BINS_AC   "clip.audio.num_mel_bins_acoustic"
 
 
 //
@@ -242,6 +246,12 @@
 #define TN_STD_BIAS              "v.std_bias"
 #define TN_STD_SCALE             "v.std_scale"
 
+// dasheng (midashenglm)
+#define TN_A_INIT_BN_SCALE "a.init_bn.scale"
+#define TN_A_INIT_BN_SHIFT "a.init_bn.shift"
+#define TN_A_PATCH_EMBD_W  "a.patch_embd.weight"
+#define TN_A_PATCH_EMBD_B  "a.patch_embd.bias"
+
 
 // align x to upper multiple of n
 #define CLIP_ALIGN(x, n) ((((x) + (n) - 1) / (n)) * (n))
@@ -293,6 +303,8 @@ enum projector_type {
     PROJECTOR_TYPE_KIMIK25,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_HUNYUANOCR,
+    PROJECTOR_TYPE_MIDASHENGLM,
+    PROJECTOR_TYPE_MIDASHENGLM_TOK,
     PROJECTOR_TYPE_UNKNOWN,
 };
 
@@ -338,6 +350,8 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_KIMIK25,   "kimik25"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL, "nemotron_v2_vl"},
     { PROJECTOR_TYPE_HUNYUANOCR, "hunyuanocr"},
+    { PROJECTOR_TYPE_MIDASHENGLM, "midashenglm"},
+    { PROJECTOR_TYPE_MIDASHENGLM_TOK, "midashenglm_dasheng_tokenizer"},
 };
 
 static projector_type clip_projector_type_from_string(const std::string & str) {

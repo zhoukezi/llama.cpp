@@ -947,6 +947,11 @@ static ggml_cgraph * clip_image_build_graph(clip_ctx * ctx, const clip_image_f32
             {
                 builder = std::make_unique<clip_graph_youtuvl>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_MIDASHENGLM:
+        case PROJECTOR_TYPE_MIDASHENGLM_TOK:
+            {
+                builder = std::make_unique<clip_graph_midashenglm>(ctx, img);
+            } break;
         default:
             GGML_ABORT("missing cgraph builder");
     }
@@ -1482,6 +1487,42 @@ struct clip_model_loader {
                     {
                         hparams.image_pad_color   = {127, 127, 127};
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                    } break;
+                case PROJECTOR_TYPE_MIDASHENGLM:
+                case PROJECTOR_TYPE_MIDASHENGLM_TOK:
+                    {
+                        get_u32(KEY_A_PROJ_STACK_FACTOR, hparams.proj_stack_factor, true);
+                        get_u32(KEY_A_TARGET_LENGTH, hparams.audio_target_length, false);
+                        get_u32(KEY_A_NUM_MEL_BINS_AC, hparams.n_mel_bins_acoustic, false);
+                        hparams.ffn_op = FFN_GELU;
+                        log_ffn_op     = "gelu";
+
+                        // audio preprocessing params (from model config)
+                        hparams.audio_chunk_len   = -1;  // not used (no fixed chunking)
+                        hparams.audio_sample_rate = 16000;
+                        hparams.audio_n_fft       = 512;
+                        hparams.audio_window_len  = 512;
+                        hparams.audio_hop_len     = 160;
+
+                        // patch size / stride arrays
+                        {
+                            std::vector<int> ps, pst;
+                            get_arr_int(KEY_A_PATCH_SIZE, ps, false);
+                            get_arr_int(KEY_A_PATCH_STRIDE, pst, false);
+                            if (ps.size() >= 2) {
+                                hparams.audio_patch_size[0] = ps[0];
+                                hparams.audio_patch_size[1] = ps[1];
+                            }
+                            if (pst.size() >= 2) {
+                                hparams.audio_patch_stride[0] = pst[0];
+                                hparams.audio_patch_stride[1] = pst[1];
+                            }
+                        }
+
+                        // Set warmup size to match target_length for position embedding bounds
+                        if (hparams.audio_target_length > 0) {
+                            hparams.warmup_audio_size = hparams.audio_target_length;
+                        }
                     } break;
                 default:
                     throw std::runtime_error(string_format("%s: unknown vision projector type %s\n", __func__, proj_type.c_str()));
@@ -2340,6 +2381,29 @@ struct clip_model_loader {
                         layer.conv_pw2_b   = get_tensor(string_format(TN_CONV_PW2,  prefix, il, "bias"));
                     }
                 } break;
+            case PROJECTOR_TYPE_MIDASHENGLM:
+            case PROJECTOR_TYPE_MIDASHENGLM_TOK:
+                {
+                    // Dasheng BatchNorm (fused: scale and shift)
+                    model.init_bn_scale  = get_tensor(TN_A_INIT_BN_SCALE);
+                    model.init_bn_shift  = get_tensor(TN_A_INIT_BN_SHIFT);
+                    // Patch embedding Conv2d
+                    model.a_patch_embd_w = get_tensor(TN_A_PATCH_EMBD_W);
+                    model.a_patch_embd_b = get_tensor(TN_A_PATCH_EMBD_B, false);
+                    // Projector MLP: mm.0 and mm.2
+                    model.mm_0_w         = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+                    model.mm_0_b         = get_tensor(string_format(TN_LLAVA_PROJ, 0, "bias"), false);
+                    model.mm_2_w         = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b         = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
+
+                    // DashengTokenizer acoustic branch (optional)
+                    if (model.proj_type == PROJECTOR_TYPE_MIDASHENGLM_TOK) {
+                        model.a_ac_patch_embd_w = get_tensor("a.acoustic.patch_embd.weight");
+                        model.a_ac_patch_embd_b = get_tensor("a.acoustic.patch_embd.bias");
+                        model.a_ac_post_ln_w    = get_tensor("a.acoustic.post_ln.weight");
+                        model.a_ac_post_ln_b    = get_tensor("a.acoustic.post_ln.bias");
+                    }
+                } break;
             default:
                 GGML_ASSERT(false && "unknown projector type");
         }
@@ -2406,7 +2470,7 @@ struct clip_model_loader {
             LOG_INF("%s: warmup with image size = %d x %d\n", __func__, img->nx, img->ny);
         } else {
             img->nx = hparams.warmup_audio_size;
-            img->ny = hparams.n_mel_bins;
+            img->ny = hparams.n_mel_bins + hparams.n_mel_bins_acoustic;
             LOG_INF("%s: warmup with audio size = %d\n", __func__, img->nx);
         }
         batch.entries.push_back(std::move(img));
@@ -3023,6 +3087,27 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                 }
                 n_patches = n;
             } break;
+        case PROJECTOR_TYPE_MIDASHENGLM:
+        case PROJECTOR_TYPE_MIDASHENGLM_TOK:
+            {
+                // n_frames = img->nx
+                // For DashengTokenizer, img->ny includes acoustic bins
+                const int n_mel_ac       = params.n_mel_bins_acoustic;
+                const int n_mel_sem      = img->ny - n_mel_ac;            // semantic mel bins
+                const int stride_w       = params.audio_patch_stride[1];  // time stride
+                const int n_time_patches = img->nx / stride_w;
+                const int k              = params.proj_stack_factor;
+                if (n_mel_ac > 0) {
+                    // DashengTokenizer: output length = acoustic n_time_patches / k
+                    n_patches = n_time_patches / k;
+                } else {
+                    // Plain Dasheng: chunked to target_length
+                    const int stride_h       = params.audio_patch_stride[0];
+                    const int n_freq_patches = n_mel_sem / stride_h;
+                    int       n_pos          = n_freq_patches * n_time_patches;
+                    n_patches                = n_pos / k;
+                }
+            } break;
         default:
             GGML_ABORT("unsupported projector type");
     }
@@ -3463,6 +3548,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         case PROJECTOR_TYPE_PHI4:
         case PROJECTOR_TYPE_COGVLM:
         case PROJECTOR_TYPE_HUNYUANOCR:
+        case PROJECTOR_TYPE_MIDASHENGLM:
+        case PROJECTOR_TYPE_MIDASHENGLM_TOK:
             {
                 // do nothing
             } break;
@@ -3700,6 +3787,9 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
             return ctx->model.position_embeddings->ne[0];
         case PROJECTOR_TYPE_GEMMA4A:
             return ctx->model.hparams.projection_dim;
+        case PROJECTOR_TYPE_MIDASHENGLM:
+        case PROJECTOR_TYPE_MIDASHENGLM_TOK:
+            return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_GLM4V:
             return ctx->model.mm_ffn_down_w->ne[1];
         default:

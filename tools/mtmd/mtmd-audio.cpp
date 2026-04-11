@@ -277,6 +277,7 @@ struct filter_params {
     bool    use_natural_log = false;
     bool    norm_per_feature = false;
     bool    use_magnitude   = false;  // |X| instead of |X|^2
+    bool    skip_post_norm  = false;  // skip Whisper-style clamping and normalization
     float   mel_floor       = 5.960464477539063e-08f;
 };
 
@@ -487,7 +488,7 @@ static bool log_mel_spectrogram(
                 out.data[i * out.n_len + j] = 0.0;
             }
         }
-    } else if (!params.no_padding) {
+    } else if (!params.no_padding && !params.skip_post_norm) {
         // Whisper-style clamping and normalization (NOT used by Gemma4)
         double mmax = -1e20;
         for (int i = 0; i < out.n_mel*out.n_len; i++) {
@@ -726,6 +727,164 @@ bool mtmd_audio_preprocessor_gemma4a::preprocess(const float *                 s
         out_chunk.n_len = std::min(out_chunk.n_len, pt_frames);
 
         output.push_back(std::move(out_chunk));
+    }
+
+    return true;
+}
+
+//
+// mtmd_audio_preprocessor_dasheng
+//
+
+void mtmd_audio_preprocessor_dasheng::initialize() {
+    int n_fft       = hparams.audio_n_fft;
+    int sample_rate = hparams.audio_sample_rate;
+    int n_mel       = hparams.n_mel_bins;
+    int n_mel_ac    = hparams.n_mel_bins_acoustic;
+    int win_len     = hparams.audio_window_len;
+
+    // Semantic branch STFT
+    cache.fill_sin_cos_table(n_fft);
+    cache.fill_hann_window(win_len, true);
+    cache.fill_mel_filterbank_matrix(n_mel, n_fft, sample_rate, 0.0f, 8000.0f, false, 1.0f, true);
+
+    // Acoustic branch STFT
+    if (n_mel_ac > 0) {
+        const int ac_n_fft = 1024;
+        cache_ac.fill_sin_cos_table(ac_n_fft);
+        cache_ac.fill_hann_window(ac_n_fft, true);
+        cache_ac.fill_mel_filterbank_matrix(n_mel_ac, ac_n_fft, sample_rate, 0.0f, float(sample_rate) / 2.0f, false,
+                                            1.0f, true);
+    }
+}
+
+bool mtmd_audio_preprocessor_dasheng::preprocess(const float *                 samples,
+                                                 size_t                        n_samples,
+                                                 std::vector<mtmd_audio_mel> & output) {
+    if (n_samples == 0) {
+        return false;
+    }
+
+    const int  n_fft         = hparams.audio_n_fft;
+    const int  hop_length    = hparams.audio_hop_len;
+    const int  win_len       = hparams.audio_window_len;
+    const int  n_mel_sem     = hparams.n_mel_bins;
+    const int  n_mel_ac      = hparams.n_mel_bins_acoustic;
+    const int  target_length = hparams.audio_target_length;
+    const bool has_acoustic  = (n_mel_ac > 0);
+
+    GGML_ASSERT(!cache.sin_vals.empty());
+    GGML_ASSERT(!cache.filters.data.empty());
+
+    // Semantic mel
+    filter_params sem_params;
+    sem_params.n_mel            = n_mel_sem;
+    sem_params.n_fft_bins       = 1 + (n_fft / 2);
+    sem_params.hann_window_size = win_len;
+    sem_params.hop_length       = hop_length;
+    sem_params.sample_rate      = hparams.audio_sample_rate;
+    sem_params.center_padding   = true;
+    sem_params.preemph          = 0.0f;
+    sem_params.use_natural_log  = false;
+    sem_params.norm_per_feature = false;
+    sem_params.skip_post_norm   = true;
+
+    mtmd_audio_mel mel_sem;
+    bool           ok = log_mel_spectrogram(samples, n_samples, 4, sem_params, cache, mel_sem);
+    if (!ok) {
+        return false;
+    }
+
+    // Semantic post-processing
+    const float top_db = 120.0f;
+    for (auto & v : mel_sem.data) {
+        v *= 10.0f;
+    }
+    float max_db = -1e20f;
+    for (auto & v : mel_sem.data) {
+        if (v > max_db) {
+            max_db = v;
+        }
+    }
+    float min_db = max_db - top_db;
+    for (auto & v : mel_sem.data) {
+        if (v < min_db) {
+            v = min_db;
+        }
+    }
+
+    // Acoustic mel
+    mtmd_audio_mel mel_ac;
+    if (has_acoustic) {
+        GGML_ASSERT(!cache_ac.sin_vals.empty());
+
+        const int     ac_n_fft = 1024;
+        filter_params ac_params;
+        ac_params.n_mel            = n_mel_ac;
+        ac_params.n_fft_bins       = 1 + (ac_n_fft / 2);
+        ac_params.hann_window_size = ac_n_fft;
+        ac_params.hop_length       = hop_length;
+        ac_params.sample_rate      = hparams.audio_sample_rate;
+        ac_params.center_padding   = true;
+        ac_params.preemph          = 0.0f;
+        ac_params.use_natural_log  = true;  // ln(max(amplitude, 1e-7))
+        ac_params.norm_per_feature = false;
+        ac_params.use_magnitude    = true;
+        ac_params.skip_post_norm   = true;
+
+        ok = log_mel_spectrogram(samples, n_samples, 4, ac_params, cache_ac, mel_ac);
+        if (!ok) {
+            return false;
+        }
+    }
+
+    const int n_len     = mel_sem.n_len;
+    const int total_mel = n_mel_sem + (has_acoustic ? n_mel_ac : 0);
+
+    if (has_acoustic) {
+        // DashengTokenizer
+        mtmd_audio_mel combined;
+        combined.n_mel     = total_mel;
+        combined.n_len     = n_len;
+        combined.n_len_org = n_len;
+        combined.data.resize(total_mel * n_len, 0.0f);
+
+        // Copy semantic
+        for (int m = 0; m < n_mel_sem; m++) {
+            for (int t = 0; t < n_len; t++) {
+                combined.data[m * n_len + t] = mel_sem.data[m * mel_sem.n_len + t];
+            }
+        }
+        // Copy acoustic
+        int ac_len = std::min(n_len, mel_ac.n_len);
+        for (int m = 0; m < n_mel_ac; m++) {
+            for (int t = 0; t < ac_len; t++) {
+                combined.data[(n_mel_sem + m) * n_len + t] = mel_ac.data[m * mel_ac.n_len + t];
+            }
+        }
+
+        output.push_back(std::move(combined));
+    } else {
+        // Plain Dasheng
+        const int n_chunks = (n_len + target_length - 1) / target_length;
+
+        for (int c = 0; c < n_chunks; c++) {
+            mtmd_audio_mel chunk;
+            chunk.n_mel     = n_mel_sem;
+            chunk.n_len     = target_length;
+            chunk.n_len_org = target_length;
+            chunk.data.resize(n_mel_sem * target_length, 0.0f);
+
+            for (int m = 0; m < n_mel_sem; m++) {
+                for (int t = 0; t < target_length; t++) {
+                    int src_t = c * target_length + t;
+                    if (src_t < n_len) {
+                        chunk.data[m * target_length + t] = mel_sem.data[m * mel_sem.n_len + src_t];
+                    }
+                }
+            }
+            output.push_back(std::move(chunk));
+        }
     }
 
     return true;
