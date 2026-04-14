@@ -445,17 +445,22 @@ static bool log_mel_spectrogram(
     out.data.resize(out.n_mel * out.n_len);
 
     {
-        std::vector<std::thread> workers(n_threads - 1);
-        for (int iw = 0; iw < n_threads - 1; ++iw) {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+        const int actual_threads = 1;
+#else
+        const int actual_threads = n_threads;
+#endif
+        std::vector<std::thread> workers(actual_threads - 1);
+        for (int iw = 0; iw < actual_threads - 1; ++iw) {
             workers[iw] =
                 std::thread(log_mel_spectrogram_worker_thread, iw + 1, hann, std::cref(samples_padded), n_samples,
-                            frame_size, frame_step, n_threads, std::cref(params), std::cref(cache), std::ref(out));
+                            frame_size, frame_step, actual_threads, std::cref(params), std::cref(cache), std::ref(out));
         }
 
         // main thread
-        log_mel_spectrogram_worker_thread(0, hann, samples_padded, n_samples, frame_size, frame_step, n_threads, params,
+        log_mel_spectrogram_worker_thread(0, hann, samples_padded, n_samples, frame_size, frame_step, actual_threads, params,
                                           cache, out);
-        for (int iw = 0; iw < n_threads - 1; ++iw) {
+        for (int iw = 0; iw < actual_threads - 1; ++iw) {
             workers[iw].join();
         }
     }
