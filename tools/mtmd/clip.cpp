@@ -1595,7 +1595,7 @@ struct clip_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        auto fin = std::ifstream(fname, std::ios::binary);
+        FILE * fin = ggml_fopen(fname.c_str(), "rb");
         if (!fin) {
             throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
         }
@@ -1647,9 +1647,9 @@ struct clip_model_loader {
                 return default_val;
             }
             size_t offset = it->second;
-            fin.seekg(offset, std::ios::beg);
+            fseek(fin, offset, SEEK_SET);
             float value;
-            fin.read(reinterpret_cast<char*>(&value), sizeof(float));
+            fread(&value, sizeof(float), 1, fin);
             return value;
         };
 
@@ -2418,26 +2418,22 @@ struct clip_model_loader {
             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             for (auto & t : tensors_to_load) {
                 ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
-                GGML_ASSERT(cur && "tensor not found in ctx_data");
-                auto it_off = tensor_offset.find(t->name);
-                GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
-                const size_t offset = it_off->second;
-                fin.seekg(offset, std::ios::beg);
-                if (!fin) {
+                const size_t offset = tensor_offset[t->name];
+                if (fseek(fin, offset, SEEK_SET) != 0) {
                     throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
                 }
                 size_t num_bytes = ggml_nbytes(cur);
                 if (ggml_backend_buft_is_host(buft)) {
                     // for the CPU and Metal backend, we can read directly into the tensor
-                    fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                    fread(cur->data, 1, num_bytes, fin);
                 } else {
                     // read into a temporary buffer first, then copy to device memory
                     read_buf.resize(num_bytes);
-                    fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
+                    fread(read_buf.data(), 1, num_bytes, fin);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
                 }
             }
-            fin.close();
+            fclose(fin);
 
             LOG_DBG("%s: loaded %zu tensors from %s\n", __func__, tensors_to_load.size(), fname.c_str());
         }
